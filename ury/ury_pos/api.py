@@ -2,6 +2,7 @@ import frappe
 from frappe import _
 from datetime import date, datetime, timedelta
 from frappe.utils import validate_phone_number
+from frappe.utils import cint
 
 
 #GetTable  decripted temporarily
@@ -452,78 +453,106 @@ def getPosProfile():
     printer = None
     cashier = None
     owner = None
-    posProfile = frappe.db.exists("POS Profile", {"branch": branchName})
-    pos_profiles = frappe.get_doc("POS Profile", posProfile)
-    global_defaults = frappe.get_single('Global Defaults')
+
+    pos_profile_name = None
+
+    # 1) Try to get POS Profile by branch
+    if branchName:
+        pos_profile_name = frappe.db.exists("POS Profile", {"branch": branchName})
+
+    # 2) Fallback: get POS Profile from assigned user
+    if not pos_profile_name:
+        assigned_profiles = frappe.get_all(
+            "POS Profile User",
+            filters={"user": waiter},
+            fields=["parent", "default", "idx"]
+        )
+        if assigned_profiles:
+            assiged_profiles = sorted(
+                assigned_profiles, 
+                key=lambda d: (0 if cint(d.get("default")) else 1, d.get("idx") or 0)
+            )
+            pos_profile_name = assiged_profiles[0].parent
+
+    # 3) Stop clearly if still not found
+    if not pos_profile_name:
+        frappe.throw(f"No POS Profile assigned for user {waiter}")
+
+    pos_profiles = frappe.get_doc("POS Profile", pos_profile_name)
+    global_defaults = frappe.get_single("Global Defaults")
     disable_rounded_total = global_defaults.disable_rounded_total
-    
 
-    if pos_profiles.branch == branchName:
-        pos_profile_name = pos_profiles.name
-        warehouse = pos_profiles.warehouse
-        branch = pos_profiles.branch
-        company = pos_profiles.company
-        tableAttention = pos_profiles.table_attention_time
-        get_cashier = frappe.get_doc("POS Profile", pos_profile_name)
-        print_format = pos_profiles.print_format
-        paid_limit=pos_profiles.paid_limit
-        enable_discount = pos_profiles.custom_enable_discount
-        multiple_cashier = pos_profiles.custom_enable_multiple_cashier
-        edit_order_type = pos_profiles.custom_edit_order_type
-        enable_kot_reprint = pos_profiles.custom_enable_kot_reprint
-        if multiple_cashier:
-            details = getBranchRoom()
-            room = details[0].get('name') 
-            branch = details[0].get('branch')
+    # Use actual profile values as final source of truth
+    pos_profile_name = pos_profiles.name
+    warehouse = pos_profiles.warehouse
+    branch = pos_profiles.branch
+    company = pos_profiles.company
+    tableAttention = pos_profiles.table_attention_time
+    print_format = pos_profiles.print_format
+    paid_limit = pos_profiles.paid_limit
+    enable_discount = pos_profiles.custom_enable_discount
+    multiple_cashier = pos_profiles.custom_enable_multiple_cashier
+    edit_order_type = pos_profiles.custom_edit_order_type
+    enable_kot_reprint = pos_profiles.custom_enable_kot_reprint
+    qz_print = pos_profiles.qz_print
 
+    get_cashier = pos_profiles
+
+    if multiple_cashier:
+        details = getBranchRoom()
+        room = details[0].get("name") if details else None
+        room_branch = details[0].get("branch") if details else branch
+
+        pos_opened_cashier = None
+        if room and room_branch:
             pos_opening_list = frappe.db.sql("""
-                SELECT DISTINCT `tabPOS Opening Entry`.name 
+                SELECT DISTINCT `tabPOS Opening Entry`.name
                 FROM `tabPOS Opening Entry`
-                INNER JOIN `tabMultiple Rooms` 
-                ON `tabMultiple Rooms`.parent = `tabPOS Opening Entry`.name
+                INNER JOIN `tabMultiple Rooms`
+                    ON `tabMultiple Rooms`.parent = `tabPOS Opening Entry`.name
                 WHERE `tabPOS Opening Entry`.branch = %s
-                AND `tabPOS Opening Entry`.status = 'Open'
-                AND `tabPOS Opening Entry`.docstatus = 1
-                AND `tabMultiple Rooms`.room = %s
-            """, (branch, room), as_dict=True)
+                    AND `tabPOS Opening Entry`.status = 'Open'
+                    AND `tabPOS Opening Entry`.docstatus = 1
+                    AND `tabMultiple Rooms`.room = %s
+            """, (room_branch, room), as_dict=True)
+
             if pos_opening_list:
                 pos_opened_cashier = frappe.db.get_value(
                     "POS Opening Entry",
                     {"name": pos_opening_list[0].name},
-                    "user",)
-            else:
-                pos_opened_cashier = None
-            for user_details in get_cashier.applicable_for_users:
-                if user_details.custom_main_cashier:
-                    owner = user_details.user
-                
-                if frappe.session.user == owner:
-                    cashier = owner
-                else:
-                    cashier = pos_opened_cashier    
-                
-        else:    
-            cashier = get_cashier.applicable_for_users[0].user
-            owner = get_cashier.applicable_for_users[0].user
-        
-        qz_print = pos_profiles.qz_print
-        print_type = None
+                    "user"
+                )
 
-        for pos_profile in pos_profiles.printer_settings:
-            if pos_profile.bill == 1:
-                printer = pos_profile.printer
-                bill_present = True
+        for user_details in get_cashier.applicable_for_users:
+            if user_details.custom_main_cashier:
+                owner = user_details.user
                 break
 
-        if qz_print == 1:
-            print_type = "qz"
-            qz_host = pos_profiles.qz_host
-
-        elif bill_present == True:
-            print_type = "network"
-
+        if frappe.session.user == owner:
+            cashier = owner
         else:
-            print_type = "socket"
+            cashier = pos_opened_cashier or owner
+
+    else:
+        if get_cashier.applicable_for_users:
+            cashier = get_cashier.applicable_for_users[0].user
+            owner = get_cashier.applicable_for_users[0].user
+
+    print_type = None
+
+    for pos_profile in pos_profiles.printer_settings:
+        if pos_profile.bill == 1:
+            printer = pos_profile.printer
+            bill_present = True
+            break
+
+    if qz_print == 1:
+        print_type = "qz"
+        qz_host = pos_profiles.qz_host
+    elif bill_present:
+        print_type = "network"
+    else:
+        print_type = "socket"
 
     invoice_details = {
         "pos_profile": pos_profile_name,
@@ -538,18 +567,16 @@ def getPosProfile():
         "printer": printer,
         "print_type": print_type,
         "tableAttention": tableAttention,
-        "paid_limit":paid_limit,
-        "disable_rounded_total":disable_rounded_total,
-        "enable_discount":enable_discount,
-        "multiple_cashier":multiple_cashier,
-        "owner":owner,
-        "edit_order_type":edit_order_type,
-        "enable_kot_reprint":enable_kot_reprint
-
+        "paid_limit": paid_limit,
+        "disable_rounded_total": disable_rounded_total,
+        "enable_discount": enable_discount,
+        "multiple_cashier": multiple_cashier,
+        "owner": owner,
+        "edit_order_type": edit_order_type,
+        "enable_kot_reprint": enable_kot_reprint
     }
 
     return invoice_details
-
 
 @frappe.whitelist()
 def getPosInvoiceItems(invoice):
